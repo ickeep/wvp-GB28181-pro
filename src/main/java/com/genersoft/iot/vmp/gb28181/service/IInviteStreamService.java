@@ -63,6 +63,9 @@ public interface IInviteStreamService {
      */
     boolean onceAndFirst(InviteSessionType type, Integer channelId, String stream, ErrorCallback<StreamInfo> callback);
 
+    /** 只读检查通道是否仍有等待结果的认领，覆盖 InviteInfo 尚未写入的准备窗口。 */
+    boolean hasPendingInvite(InviteSessionType type, Integer channelId);
+
     /**
      * 调用一个invite回调
      */

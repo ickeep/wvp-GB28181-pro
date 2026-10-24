@@ -4,6 +4,7 @@ import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONObject;
 import com.genersoft.iot.vmp.media.bean.MediaServer;
 import com.genersoft.iot.vmp.utils.SSLSocketClientUtil;
+import com.huashicloud.wvp.AssistProtocol;
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.*;
 import okhttp3.logging.HttpLoggingInterceptor;
@@ -241,14 +242,18 @@ public class AssistRESTfulUtils {
         return responseJSON;
     }
 
+    /** 查询指定媒体节点的录像辅助服务信息。 */
     public JSONObject getInfo(MediaServer mediaServerItem, RequestCallback callback){
         Map<String, Object> param = new HashMap<>();
         return sendGet(mediaServerItem, "api/record/info",param, callback);
     }
 
+    // 创建录像合并任务，并修正误从外部请求继承的内部 Assist 协议。
     public JSONObject addTask(MediaServer mediaServerItem, String app, String stream, String startTime,
                               String endTime, String callId, List<String> filePathList, String remoteHost) {
 
+        // 仅对配置匹配的内部明文端口降为 HTTP，外部 HTTPS 下载地址保持原样。
+        remoteHost = AssistProtocol.normalize(remoteHost, mediaServerItem.getIp(), mediaServerItem.getRecordAssistPort());
         JSONObject videoTaskInfoJSON = new JSONObject();
         videoTaskInfoJSON.put("app", app);
         videoTaskInfoJSON.put("stream", stream);
@@ -263,6 +268,7 @@ public class AssistRESTfulUtils {
         return sendPost(mediaServerItem, urlStr, videoTaskInfoJSON, null, 30);
     }
 
+    // 使用 Assist 内部明文端口查询任务，不继承浏览器经过代理后的 HTTPS 协议。
     public JSONObject queryTaskList(MediaServer mediaServerItem, String app, String stream, String callId,
                                     String taskId, Boolean isEnd, String scheme) {
         Map<String, Object> param = new HashMap<>();
@@ -282,7 +288,7 @@ public class AssistRESTfulUtils {
             param.put("isEnd", isEnd);
         }
         String urlStr = String.format("%s://%s:%s/api/record/file/download/task/list",
-                scheme, mediaServerItem.getIp(), mediaServerItem.getRecordAssistPort());;
+                "http", mediaServerItem.getIp(), mediaServerItem.getRecordAssistPort());
         return sendGet(mediaServerItem, urlStr, param, null);
     }
 }

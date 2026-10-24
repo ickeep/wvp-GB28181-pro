@@ -24,6 +24,7 @@ import org.springframework.stereotype.Service;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -86,8 +87,8 @@ public class InviteStreamServiceImpl implements IInviteStreamService {
     public void onApplicationEvent(MediaDepartureEvent event) {
         if ("rtsp".equals(event.getSchema()) && MediaStreamUtil.isGB28181(event.getApp(), event.getStream())) {
             InviteInfo inviteInfo = getInviteInfoByStream(null, event.getStream());
-            if (inviteInfo != null && (inviteInfo.getType() == InviteSessionType.PLAY
-                    || inviteInfo.getType() == InviteSessionType.PLAYBACK)) {
+            // 回放由 PlayService 的同流临界区负责清理，不能在第二个异步监听器中误删新回放。
+            if (inviteInfo != null && inviteInfo.getType() == InviteSessionType.PLAY) {
                 if (isStaleStreamDeparture(inviteInfo, event.getCreateStamp())) {
                     log.info("[流离开] 流实例创建时间早于当前会话，判定为旧会话的迟到注销事件，跳过清理: stream={}, deviceId={}, channelId={}",
                             event.getStream(), inviteInfo.getDeviceId(), inviteInfo.getChannelId());
@@ -291,11 +292,19 @@ public class InviteStreamServiceImpl implements IInviteStreamService {
         registerCallback(type, channelId, stream, callback, null);
     }
 
+    /** 原子登记本次等待者并返回是否取得点播发起权，不重复发送在途请求。 */
     @Override
     public boolean onceAndFirst(InviteSessionType type, Integer channelId, String stream, ErrorCallback<StreamInfo> callback) {
         AtomicBoolean first = new AtomicBoolean(false);
         registerCallback(type, channelId, stream, callback, first);
         return first.get();
+    }
+
+    /** 检查既有回调认领，不触发超时回收、回调通知或 Redis 写入。 */
+    @Override
+    public boolean hasPendingInvite(InviteSessionType type, Integer channelId) {
+        return inviteCallbackMap.values().stream().anyMatch(holder ->
+                holder.type == type && Objects.equals(holder.channelId, channelId));
     }
 
     /**
