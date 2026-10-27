@@ -86,7 +86,7 @@ public class InviteStreamServiceImpl implements IInviteStreamService {
     @EventListener
     public void onApplicationEvent(MediaDepartureEvent event) {
         if ("rtsp".equals(event.getSchema()) && MediaStreamUtil.isGB28181(event.getApp(), event.getStream())) {
-            InviteInfo inviteInfo = getInviteInfoByStream(null, event.getStream());
+            InviteInfo inviteInfo = getInviteInfoByStreamPreferPlay(event.getStream());
             // 回放由 PlayService 的同流临界区负责清理，不能在第二个异步监听器中误删新回放。
             if (inviteInfo != null && inviteInfo.getType() == InviteSessionType.PLAY) {
                 if (isStaleStreamDeparture(inviteInfo, event.getCreateStamp())) {
@@ -110,6 +110,7 @@ public class InviteStreamServiceImpl implements IInviteStreamService {
         }
     }
 
+    /** 持久化会话当前状态，并沿用默认缓存更新策略。 */
     @Override
     public void updateInviteInfo(InviteInfo inviteInfo) {
         if (InviteSessionStatus.ready == inviteInfo.getStatus()) {
@@ -117,6 +118,32 @@ public class InviteStreamServiceImpl implements IInviteStreamService {
         } else {
             updateInviteInfo(inviteInfo, null);
         }
+    }
+
+    /** 为当前缓存会话写入绝对保留期限，等待下载成品回调且支持重启后的定时回收。 */
+    @Override
+    public void setInviteInfoCleanTime(InviteInfo inviteInfo, long keepTimeMs) {
+        if (inviteInfo == null || inviteInfo.getType() == null || inviteInfo.getChannelId() == null
+                || inviteInfo.getStream() == null || keepTimeMs <= 0) {
+            log.warn("[设置Invite保留窗口]，参数不全： {}", JSON.toJSON(inviteInfo));
+            return;
+        }
+        InviteInfo inviteInfoInRedis = getInviteInfo(inviteInfo.getType(), inviteInfo.getChannelId(), inviteInfo.getStream());
+        if (inviteInfoInRedis == null) {
+            log.warn("[设置Invite保留窗口]，未从缓存中读取到Invite信息： deviceId: {}, channel: {}, stream: {}",
+                    inviteInfo.getDeviceId(), inviteInfo.getChannelId(), inviteInfo.getStream());
+            return;
+        }
+        long cleanTime = System.currentTimeMillis() + keepTimeMs;
+        inviteInfoInRedis.setCleanTime(cleanTime);
+        if (inviteInfoInRedis.getCreateTime() == null) {
+            inviteInfoInRedis.setCreateTime(System.currentTimeMillis());
+        }
+        String key = VideoManagerConstants.INVITE_PREFIX;
+        String objectKey = inviteInfoInRedis.getType() +
+                ":" + inviteInfoInRedis.getChannelId() +
+                ":" + inviteInfoInRedis.getStream();
+        redisTemplate.opsForHash().put(key, objectKey, inviteInfoInRedis);
     }
 
     @Override
@@ -245,9 +272,25 @@ public class InviteStreamServiceImpl implements IInviteStreamService {
         return getInviteInfo(type, channelId, null);
     }
 
+    /** 按会话类型和流名读取当前缓存，供具备明确归属的调用方使用。 */
     @Override
     public InviteInfo getInviteInfoByStream(InviteSessionType type, String stream) {
         return getInviteInfo(type, null, stream);
+    }
+
+    /** 同名流优先匹配点播或回放，避免保留中的下载缓存遮蔽真正需要清理的会话。 */
+    @Override
+    public InviteInfo getInviteInfoByStreamPreferPlay(String stream) {
+        InviteInfo inviteInfo = getInviteInfo(InviteSessionType.PLAY, null, stream);
+        if (inviteInfo != null) {
+            return inviteInfo;
+        }
+        inviteInfo = getInviteInfo(InviteSessionType.PLAYBACK, null, stream);
+        if (inviteInfo != null) {
+            return inviteInfo;
+        }
+        // 其他类型（含保留中的录像下载会话）维持原有的通配查询逻辑
+        return getInviteInfoByStream(null, stream);
     }
 
     @Override
@@ -546,6 +589,7 @@ public class InviteStreamServiceImpl implements IInviteStreamService {
         return inviteInfoInDb;
     }
 
+    /** 扫描本实例Invite缓存，按保留期限和请求生命周期回收过期条目。 */
     @Scheduled(fixedRate = 10000)   //定时检测,清理错误的redis数据,防止因为错误数据导致的点播不可用
     public void execute(){
         // 先做内存认领的兜底清理，再做 Redis 数据清理：
@@ -559,6 +603,12 @@ public class InviteStreamServiceImpl implements IInviteStreamService {
         for (Object value : values) {
             try {
                 InviteInfo inviteInfo = (InviteInfo)value;
+                if (inviteInfo.getCleanTime() != null) {
+                    // 带保留窗口的条目（录像下载）由 cleanTime 决定生命周期，未到期一律保留，
+                    // 不能继续走下面“ready 阶段”的清理规则，否则会把正在使用的会话删掉。
+                    cleanInviteInfoByCleanTime(inviteInfo);
+                    continue;
+                }
                 if (inviteInfo.getStreamInfo() != null) {
                     continue;
                 }
@@ -575,6 +625,31 @@ public class InviteStreamServiceImpl implements IInviteStreamService {
                 removeInviteInfoByValue(value);
             }
         }
+    }
+
+    /**
+     * 按保留窗口回收条目。
+     *
+     * <p>只有设置了 {@link InviteInfo#getCleanTime()} 的条目会走到这里，目前是「流已离开等待写入下载地址」
+     * 的录像下载会话。未到期时保留；到期后做<b>条件删除</b>：先按 {@code type:channelId:stream} 重新读取，
+     * 只有 createTime 与快照一致时才删除，避免删掉同一 stream 上重新发起的新会话。</p>
+     */
+    private void cleanInviteInfoByCleanTime(InviteInfo inviteInfo) {
+        Long cleanTime = inviteInfo.getCleanTime();
+        if (cleanTime == null || System.currentTimeMillis() <= cleanTime) {
+            return;
+        }
+        InviteInfo current = getInviteInfo(inviteInfo.getType(), inviteInfo.getChannelId(), inviteInfo.getStream());
+        if (current == null || !Objects.equals(current.getCreateTime(), inviteInfo.getCreateTime())) {
+            return;
+        }
+        if (current.getCleanTime() == null || System.currentTimeMillis() <= current.getCleanTime()) {
+            // 期间被新一轮会话/延长保留刷新过，交给下一次检测
+            return;
+        }
+        removeInviteInfo(current);
+        log.info("[定时清理Invite] 回收录像下载会话: type={}, channelId={}, stream={}",
+                current.getType(), current.getChannelId(), current.getStream());
     }
 
     private void removeInviteInfoByValue(Object value) {

@@ -1,6 +1,11 @@
 package com.genersoft.iot.vmp.gb28181.service.impl;
 
 import com.genersoft.iot.vmp.common.InviteInfo;
+import static org.mockito.Mockito.never;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import java.util.List;
+import java.util.ArrayList;
+import com.genersoft.iot.vmp.common.InviteSessionStatus;
 import com.genersoft.iot.vmp.common.InviteSessionType;
 import com.genersoft.iot.vmp.common.StreamInfo;
 import com.genersoft.iot.vmp.conf.UserSetting;
@@ -233,5 +238,130 @@ class InviteStreamServiceImplTest {
         when(redisTemplate.opsForHash()).thenReturn(hashOperations);
         when(hashOperations.scan(anyString(), any(ScanOptions.class))).thenReturn(cursor);
         when(cursor.hasNext()).thenReturn(false);
+    }
+    /** 保留期限未到时不回收下载缓存，确保晚到成品回调仍可写入文件信息。 */
+    @Test
+    void execute_shouldKeepDownloadInviteInfoWithinCleanTime() {
+        HashOperations<String, Object, Object> hashOperations = mock(HashOperations.class);
+        when(redisTemplate.opsForHash()).thenReturn(hashOperations);
+        when(hashOperations.size(anyString())).thenReturn(1L);
+        InviteInfo inviteInfo = downloadInviteInfo(System.currentTimeMillis() + 60_000);
+        List<Object> values = new ArrayList<>();
+        values.add(inviteInfo);
+        when(hashOperations.values(anyString())).thenReturn(values);
+
+        inviteStreamService.execute();
+
+        // 保留窗口未到期，下载会话不能被回收
+        verify(hashOperations, never()).delete(anyString(), any());
+    }
+
+    /** 保留期限到达后回收原下载条目，避免重启后永久泄漏。 */
+    @Test
+    void execute_shouldRemoveDownloadInviteInfoAfterCleanTime() {
+        HashOperations<String, Object, Object> hashOperations = mock(HashOperations.class);
+        when(redisTemplate.opsForHash()).thenReturn(hashOperations);
+        when(hashOperations.size(anyString())).thenReturn(1L);
+        InviteInfo inviteInfo = downloadInviteInfo(System.currentTimeMillis() - 1);
+        List<Object> values = new ArrayList<>();
+        values.add(inviteInfo);
+        when(hashOperations.values(anyString())).thenReturn(values);
+
+        // 第 1 次 scan：按 type:channelId:stream 读取条目；第 2 次 scan：removeInviteInfo 内部读取待删除的 key
+        Cursor<Map.Entry<Object, Object>> inviteInfoCursor = mock(Cursor.class);
+        Cursor<Map.Entry<Object, Object>> keyCursor = mock(Cursor.class);
+        when(hashOperations.scan(anyString(), any(ScanOptions.class)))
+                .thenReturn(inviteInfoCursor, keyCursor);
+        when(inviteInfoCursor.hasNext()).thenReturn(true, false);
+        when(inviteInfoCursor.next()).thenReturn(Map.entry("DOWNLOAD:" + CHANNEL_ID + ":stream", inviteInfo));
+        when(keyCursor.hasNext()).thenReturn(true, false);
+        when(keyCursor.next()).thenReturn(Map.entry("DOWNLOAD:" + CHANNEL_ID + ":stream", inviteInfo));
+
+        inviteStreamService.execute();
+
+        verify(hashOperations).delete(anyString(), eq("DOWNLOAD:" + CHANNEL_ID + ":stream"));
+    }
+
+    /** 旧扫描快照到期时仍按创建时间校验，不能误删同流的新一轮下载。 */
+    @Test
+    void execute_shouldNotRemoveDownloadInviteInfoOfNewSessionWithSameStream() {
+        HashOperations<String, Object, Object> hashOperations = mock(HashOperations.class);
+        when(redisTemplate.opsForHash()).thenReturn(hashOperations);
+        when(hashOperations.size(anyString())).thenReturn(1L);
+        InviteInfo expiredInviteInfo = downloadInviteInfo(System.currentTimeMillis() - 1);
+        expiredInviteInfo.setCreateTime(System.currentTimeMillis() - 10_000);
+        List<Object> values = new ArrayList<>();
+        values.add(expiredInviteInfo);
+        when(hashOperations.values(anyString())).thenReturn(values);
+
+        // 同一 stream 上已经发起了新一轮下载（createTime 不同），不能按旧快照删除
+        InviteInfo newInviteInfo = downloadInviteInfo(System.currentTimeMillis() - 1);
+        newInviteInfo.setCreateTime(System.currentTimeMillis());
+        Cursor<Map.Entry<Object, Object>> inviteInfoCursor = mock(Cursor.class);
+        when(hashOperations.scan(anyString(), any(ScanOptions.class))).thenReturn(inviteInfoCursor);
+        when(inviteInfoCursor.hasNext()).thenReturn(true, false);
+        when(inviteInfoCursor.next())
+                .thenReturn(Map.entry("DOWNLOAD:" + CHANNEL_ID + ":stream", newInviteInfo));
+
+        inviteStreamService.execute();
+
+        verify(hashOperations, never()).delete(anyString(), any());
+    }
+
+    /** 按当前缓存条目写入绝对保留期限，而非仅修改失去归属的调用方对象。 */
+    @Test
+    void setInviteInfoCleanTime_shouldWriteCleanTimeWithKeepWindow() {
+        HashOperations<String, Object, Object> hashOperations = mock(HashOperations.class);
+        when(redisTemplate.opsForHash()).thenReturn(hashOperations);
+        InviteInfo inviteInfo = downloadInviteInfo(null);
+        Cursor<Map.Entry<Object, Object>> inviteInfoCursor = mock(Cursor.class);
+        when(hashOperations.scan(anyString(), any(ScanOptions.class))).thenReturn(inviteInfoCursor);
+        when(inviteInfoCursor.hasNext()).thenReturn(true, false);
+        when(inviteInfoCursor.next())
+                .thenReturn(Map.entry("DOWNLOAD:" + CHANNEL_ID + ":stream", inviteInfo));
+
+        long before = System.currentTimeMillis();
+        inviteStreamService.setInviteInfoCleanTime(inviteInfo, 15 * 60 * 1000L);
+
+        assertNotNull(inviteInfo.getCleanTime(), "保留窗口应该写入缓存对象");
+        assertTrue(inviteInfo.getCleanTime() >= before + 15 * 60 * 1000L);
+        verify(hashOperations).put(anyString(), eq("DOWNLOAD:" + CHANNEL_ID + ":stream"), eq(inviteInfo));
+    }
+
+    /** 同名流存在回放时优先返回回放，保留的下载条目不能遮蔽回放清理。 */
+    @Test
+    void getInviteInfoByStreamPreferPlay_shouldReturnPlaybackInsteadOfRetainedDownload() {
+        HashOperations<String, Object, Object> hashOperations = mock(HashOperations.class);
+        when(redisTemplate.opsForHash()).thenReturn(hashOperations);
+
+        Cursor<Map.Entry<Object, Object>> emptyCursor = mock(Cursor.class);
+        Cursor<Map.Entry<Object, Object>> playbackCursor = mock(Cursor.class);
+        InviteInfo playbackInviteInfo = downloadInviteInfo(null);
+        playbackInviteInfo.setType(InviteSessionType.PLAYBACK);
+        when(hashOperations.scan(anyString(), any(ScanOptions.class))).thenReturn(emptyCursor, playbackCursor);
+        when(emptyCursor.hasNext()).thenReturn(false);
+        when(playbackCursor.hasNext()).thenReturn(true, false);
+        when(playbackCursor.next())
+                .thenReturn(Map.entry("PLAYBACK:" + CHANNEL_ID + ":stream", playbackInviteInfo));
+
+        InviteInfo result = inviteStreamService.getInviteInfoByStreamPreferPlay("stream");
+
+        assertSame(playbackInviteInfo, result, "存在回放会话时不能命中保留中的下载会话");
+    }
+
+    /** 构造带保留期限和完整媒体信息的下载缓存，供定时回收边界验证复用。 */
+    private InviteInfo downloadInviteInfo(Long cleanTime) {
+        InviteInfo inviteInfo = new InviteInfo();
+        inviteInfo.setDeviceId("34020000001320000001");
+        inviteInfo.setChannelId(CHANNEL_ID);
+        inviteInfo.setStream("stream");
+        inviteInfo.setType(InviteSessionType.DOWNLOAD);
+        inviteInfo.setStatus(InviteSessionStatus.ok);
+        inviteInfo.setCreateTime(System.currentTimeMillis());
+        inviteInfo.setCleanTime(cleanTime);
+        StreamInfo streamInfo = new StreamInfo();
+        streamInfo.setStream("stream");
+        inviteInfo.setStreamInfo(streamInfo);
+        return inviteInfo;
     }
 }
