@@ -15,6 +15,7 @@ import com.genersoft.iot.vmp.gb28181.service.IDeviceChannelService;
 import com.genersoft.iot.vmp.gb28181.service.IDeviceService;
 import com.genersoft.iot.vmp.gb28181.service.IInviteStreamService;
 import com.genersoft.iot.vmp.gb28181.service.IPlayService;
+import com.genersoft.iot.vmp.gb28181.service.download.SegmentedDownloadService;
 import com.genersoft.iot.vmp.gb28181.session.SipInviteSessionManager;
 import com.genersoft.iot.vmp.gb28181.transmit.callback.DeferredResultHolder;
 import com.genersoft.iot.vmp.gb28181.transmit.callback.RequestMessage;
@@ -59,6 +60,9 @@ public class PlayController {
 
 	@Autowired
 	private SipInviteSessionManager sessionManager;
+
+	@Autowired
+	private org.springframework.beans.factory.ObjectProvider<SegmentedDownloadService> segmentedDownloads;
 
 	@Autowired
 	private IInviteStreamService inviteStreamService;
@@ -233,7 +237,12 @@ public class PlayController {
 		}
 		JSONArray objects = new JSONArray();
 		List<SsrcTransaction> allSsrc = sessionManager.getAll();
+		SegmentedDownloadService segmented = segmentedDownloads == null ? null : segmentedDownloads.getObject();
 		for (SsrcTransaction transaction : allSsrc) {
+			if (segmented != null && transaction.getType() == InviteSessionType.DOWNLOAD
+                    && segmented.isChildStream(transaction.getStream())) {
+				continue;
+			}
 			JSONObject jsonObject = new JSONObject();
 			jsonObject.put("deviceId", transaction.getDeviceId());
 			jsonObject.put("channelId", transaction.getChannelId());
@@ -246,6 +255,10 @@ public class PlayController {
 			objects.add(jsonObject);
 		}
 
+		if (segmented != null) {
+			// 对外只投影原始区间；逻辑任务不写入真实 SIP 事务表。
+			objects.addAll(segmented.sessionViews());
+		}
 		JSONObject jsonObject = new JSONObject();
 		jsonObject.put("data", objects);
 		jsonObject.put("count", objects.size());
