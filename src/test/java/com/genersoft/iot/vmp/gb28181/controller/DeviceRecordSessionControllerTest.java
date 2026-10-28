@@ -12,6 +12,7 @@ import com.genersoft.iot.vmp.gb28181.service.IDeviceChannelService;
 import com.genersoft.iot.vmp.gb28181.service.IDeviceService;
 import com.genersoft.iot.vmp.gb28181.service.IInviteStreamService;
 import com.genersoft.iot.vmp.gb28181.service.IPlayService;
+import com.genersoft.iot.vmp.gb28181.service.download.SegmentedDownloadService;
 import com.genersoft.iot.vmp.gb28181.session.SipInviteSessionManager;
 import com.genersoft.iot.vmp.media.service.IMediaServerService;
 import com.genersoft.iot.vmp.service.bean.DownloadFileInfo;
@@ -23,6 +24,7 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import org.springframework.beans.factory.ObjectProvider;
 
 import java.util.List;
 
@@ -40,11 +42,14 @@ class DeviceRecordSessionControllerTest {
     @Mock private IDeviceChannelService channels;
     @Mock private IPlayService play;
     @Mock private IMediaServerService media;
+    @Mock private ObjectProvider<SegmentedDownloadService> segmentedDownloads;
+    @Mock private SegmentedDownloadService segmented;
     @InjectMocks private PlayController controller;
 
     /** 明确物理设备的数据库身份和全部通道，不把设备级查询缩成指定单通道。 */
     @BeforeEach
     void setUp() {
+        lenient().when(segmentedDownloads.getObject()).thenReturn(segmented);
         Device device = new Device();
         device.setId(90);
         device.setDeviceId("device");
@@ -169,6 +174,61 @@ class DeviceRecordSessionControllerTest {
                 .perform(get("/api/play/record/session/device"))
                 .andExpect(status().isOk()).andExpect(jsonPath("$.code").value(0))
                 .andExpect(jsonPath("$.data").value(true));
+    }
+
+    /** 父任务排队或重试尚无子段时仍占用设备，不能仅查询原生Invite和SIP。 */
+    @Test
+    void logicalParentWaitingBeforeChildInviteIsBusy() {
+        when(segmented.hasBusyTask("device", null)).thenReturn(true);
+        assertTrue(controller.hasDeviceRecordSession("device").getData());
+        verifyNoInteractions(invites, sessions);
+    }
+
+    /** 设备关闭已确认的云端合并不占回放名额，状态由分段任务服务统一判断。 */
+    @Test
+    void safeMergingWithoutOtherSipIsFree() {
+        when(segmented.hasBusyTask("device", null)).thenReturn(false);
+        assertFalse(controller.hasDeviceRecordSession("device").getData());
+        verify(segmented).hasBusyTask("device", null);
+    }
+
+    /** 失败但尚未确认关闭的父任务仍占名额，不能被终态名称误认为设备空闲。 */
+    @Test
+    void unsafeFailedParentStillConsumesDeviceCapacity() {
+        when(segmented.hasBusyTask("device", null)).thenReturn(true);
+        assertTrue(controller.hasDeviceRecordSession("device").getData());
+        verifyNoInteractions(invites, sessions);
+    }
+
+    /** 未识别的新状态即使夹带旧文件与满进度，也不能猜测本次传输已经结束。 */
+    @Test
+    void unknownDownloadStateWithOldFileRemainsBusy() {
+        InviteInfo unknown = completedDownload();unknown.getStreamInfo().setDownloadStatus("unknown");
+        when(invites.getAllInviteInfo()).thenReturn(List.of(unknown));
+        assertTrue(controller.hasDeviceRecordSession("device").getData());
+    }
+
+    /** 中断结果可保留用于诊断和部分文件下载，设备事务已消失时不继续阻塞队列。 */
+    @Test
+    void interruptedResultWithoutRealSipIsFree() {
+        InviteInfo stopped = invite(7, InviteSessionType.DOWNLOAD);
+        StreamInfo info = new StreamInfo();info.setDownloadStatus("interrupted");info.setProgress(0.4);
+        stopped.setStreamInfo(info);
+        when(invites.getAllInviteInfo()).thenReturn(List.of(stopped));
+        assertFalse(controller.hasDeviceRecordSession("device").getData());
+    }
+
+    /** 中断缓存不能证明设备已经释放，真实待关闭Dialog仍需占用名额。 */
+    @Test
+    void interruptedResultWithPendingRealSipRemainsBusy() {
+        InviteInfo stopped = invite(7, InviteSessionType.DOWNLOAD);
+        StreamInfo info = new StreamInfo();info.setDownloadStatus("interrupted");info.setProgress(0.4);
+        stopped.setStreamInfo(info);
+        SsrcTransaction pending = transaction(7, InviteSessionType.DOWNLOAD);pending.setTerminationState("pending");
+        when(invites.getAllInviteInfo()).thenReturn(List.of(stopped));
+        when(sessions.getSsrcTransactionByDeviceId("device")).thenReturn(List.of(pending));
+        assertTrue(controller.hasDeviceRecordSession("device").getData());
+        verify(sessions).getSsrcTransactionByDeviceId("device");
     }
 
     /** 构造同设备不同通道的录像缓存，用于验证聚合身份过滤。 */

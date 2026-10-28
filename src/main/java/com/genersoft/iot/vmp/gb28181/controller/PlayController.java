@@ -15,6 +15,7 @@ import com.genersoft.iot.vmp.gb28181.service.IDeviceChannelService;
 import com.genersoft.iot.vmp.gb28181.service.IDeviceService;
 import com.genersoft.iot.vmp.gb28181.service.IInviteStreamService;
 import com.genersoft.iot.vmp.gb28181.service.IPlayService;
+import com.genersoft.iot.vmp.gb28181.service.download.SegmentedDownloadService;
 import com.genersoft.iot.vmp.gb28181.session.SipInviteSessionManager;
 import com.genersoft.iot.vmp.gb28181.transmit.callback.DeferredResultHolder;
 import com.genersoft.iot.vmp.gb28181.transmit.callback.RequestMessage;
@@ -59,6 +60,9 @@ public class PlayController {
 
 	@Autowired
 	private SipInviteSessionManager sessionManager;
+
+	@Autowired
+	private org.springframework.beans.factory.ObjectProvider<SegmentedDownloadService> segmentedDownloads;
 
 	@Autowired
 	private IInviteStreamService inviteStreamService;
@@ -233,7 +237,12 @@ public class PlayController {
 		}
 		JSONArray objects = new JSONArray();
 		List<SsrcTransaction> allSsrc = sessionManager.getAll();
+		SegmentedDownloadService segmented = segmentedDownloads == null ? null : segmentedDownloads.getObject();
 		for (SsrcTransaction transaction : allSsrc) {
+			if (segmented != null && transaction.getType() == InviteSessionType.DOWNLOAD
+                    && segmented.isChildStream(transaction.getStream())) {
+				continue;
+			}
 			JSONObject jsonObject = new JSONObject();
 			jsonObject.put("deviceId", transaction.getDeviceId());
 			jsonObject.put("channelId", transaction.getChannelId());
@@ -246,6 +255,10 @@ public class PlayController {
 			objects.add(jsonObject);
 		}
 
+		if (segmented != null) {
+			// 对外只投影原始区间；逻辑任务不写入真实 SIP 事务表。
+			objects.addAll(segmented.sessionViews());
+		}
 		JSONObject jsonObject = new JSONObject();
 		jsonObject.put("data", objects);
 		jsonObject.put("count", objects.size());
@@ -298,11 +311,16 @@ public class PlayController {
 
 	/** 汇总设备的持久会话；通道为空表示整台设备，避免已删通道的真实事务被误判为空闲。 */
 	private boolean hasStoredRecordSession(String deviceId, Integer channelId) {
-		// 必须扫描全部会话；已完成下载不能遮蔽另一条 pending 回放或下载。
+		SegmentedDownloadService segmented = segmentedDownloads == null ? null : segmentedDownloads.getObject();
+		if (segmented != null && segmented.hasBusyTask(deviceId, channelId)) {
+			return true;
+		}
+		// 父任务排队和重试可能尚无物理子段；设备关闭已确认的云端合并则不再占名额。
+		// 必须扫描全部会话；终态缓存不能遮蔽另一条 pending 回放或下载。
 		for (InviteInfo invite : inviteStreamService.getAllInviteInfo()) {
 			if (invite != null && Objects.equals(deviceId, invite.getDeviceId())
 					&& (channelId == null || Objects.equals(channelId, invite.getChannelId()))
-					&& isRecordSessionType(invite.getType()) && !isCompletedDownloadResult(invite)) {
+					&& isRecordSessionType(invite.getType()) && !isTerminalDownloadResult(invite)) {
 				return true;
 			}
 		}
@@ -323,11 +341,20 @@ public class PlayController {
 		return type == InviteSessionType.PLAYBACK || type == InviteSessionType.DOWNLOAD;
 	}
 
-	/** 同时确认下载进度和真实成品地址，避免进度四舍五入先到 1 时误判传输已释放。 */
-	private boolean isCompletedDownloadResult(InviteInfo invite) {
+	/** 中断和完整文件缓存不再占传输名额，是否真正释放仍由独立的 SIP 事务扫描确认。 */
+	private boolean isTerminalDownloadResult(InviteInfo invite) {
 		StreamInfo stream = invite.getStreamInfo();
-		if (invite.getType() != InviteSessionType.DOWNLOAD || stream == null
-				|| !Double.isFinite(stream.getProgress()) || stream.getProgress() < 1) {
+		if (invite.getType() != InviteSessionType.DOWNLOAD || stream == null) {
+			return false;
+		}
+		if ("interrupted".equals(stream.getDownloadStatus())) {
+			return true;
+		}
+		// 新协议中的封装与未知状态仍须等待；仅无状态的旧结果兼容进度和成品地址。
+		if (StringUtils.hasText(stream.getDownloadStatus()) && !"completed".equals(stream.getDownloadStatus())) {
+			return false;
+		}
+		if (!Double.isFinite(stream.getProgress()) || stream.getProgress() < 1) {
 			return false;
 		}
 		DownloadFileInfo file = stream.getDownLoadFilePath();
